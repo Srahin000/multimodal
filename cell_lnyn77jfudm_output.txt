@@ -1,0 +1,50 @@
+# ── AttackingHierarchicalFedAvg — Byzantine attack injection ─────────────────
+
+class AttackingHierarchicalFedAvg(HierarchicalFedAvg):
+    """HierarchicalFedAvg + silent stale-weight injection for a target cluster."""
+
+    def __init__(self, attack_cluster: int, attack_start_round: int, **kwargs):
+        super().__init__(**kwargs)
+        self._attack_cluster     = attack_cluster
+        self._attack_start_round = max(4, attack_start_round)
+        self._ch_actual_cache    = _deque(maxlen=6)
+
+        # Lock the target client_idx at init time — never re-targets after expulsion
+        ch_members = self._cluster_to_clients.get(attack_cluster, [])
+        self._attack_ch_idx = ch_members[0] if ch_members else None
+
+    def aggregate_fit(self, server_round, results, failures):
+        if not results:
+            return None, {}
+
+        ch_idx = self._attack_ch_idx   # always the original CH, never changes
+        results_list = list(results)
+
+        for i, (proxy, fit_res) in enumerate(results_list):
+            client_idx = self._proxy_to_client_idx(proxy)
+            if client_idx != ch_idx:
+                continue
+
+            real_weights = parameters_to_ndarrays(fit_res.parameters)
+            self._ch_actual_cache.append(real_weights)
+
+            if (server_round >= self._attack_start_round
+                    and len(self._ch_actual_cache) >= 4):
+                stale_weights   = self._ch_actual_cache[-4]
+                poisoned_params = ndarrays_to_parameters(stale_weights)
+                from flwr.common import FitRes as _FitRes
+                results_list[i] = (proxy, _FitRes(
+                    status       = fit_res.status,
+                    parameters   = poisoned_params,
+                    num_examples = fit_res.num_examples,
+                    metrics      = fit_res.metrics,
+                ))
+                print(f"  [ATTACK R{server_round}] cluster={self._attack_cluster} "
+                      f"CH={ch_idx}: injected stale weights (3 rounds old)")
+            break
+
+        return super().aggregate_fit(server_round, results_list, failures)
+
+
+print("AttackingHierarchicalFedAvg defined.")
+print("  Target CH locked at init — never re-targets after expulsion.")

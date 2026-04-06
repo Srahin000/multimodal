@@ -1,0 +1,423 @@
+# ── HierarchicalFedAvg Strategy ──────────────────────────────────────────────
+# Fixes applied (see "Remaining Issues"):
+#   [Fix 4] CH_DIVERGENCE_THRESHOLD raised 0.0001 → 0.003: normal intra-cluster
+#            divergence was ~0.0008, constantly triggering false S3. Threshold
+#            must sit above the noise floor of healthy training.
+#   [Fix 6] Divergence population moved BEFORE detection in aggregate_fit so
+#            the very round's data is available for S3 logic.
+#            len(div_hist) >= 1 (was >= 2) — faster S3 activation.
+#            Local-baseline fallback: when other_divs is empty (only-active cluster),
+#            compare against own first-5-round min divergence × 3.
+#   [DDIL]  Connectivity dropout, Multi-Krum, Reputation scoring (from prior update)
+
+from collections import defaultdict, deque as _deque
+from flwr.common import (
+    FitRes, EvaluateRes, Parameters,
+    parameters_to_ndarrays, ndarrays_to_parameters,
+)
+from flwr.server.client_proxy import ClientProxy
+
+
+class HierarchicalFedAvg(fl.server.strategy.FedAvg):
+
+    STAGNATION_THRESHOLD    = 0.999
+    LOSS_SLOPE_THRESHOLD    = 0.0001
+    ISOLATION_ROUNDS        = 4
+    REENTRY_FRACS           = [0.30, 0.70, 1.00]
+    DETECT_COOLDOWN         = 10
+    CH_DIVERGENCE_THRESHOLD = 0.003   # raised: normal div ≈ 0.0008, need headroom
+    S2_PERSISTENT_ROUNDS    = 5
+    REPUTATION_EMA          = 0.7
+    REPUTATION_FLOOR        = 0.3
+    MULTI_KRUM_F            = 1
+    USE_MULTI_KRUM          = True
+    DDIL_CONNECTIVITY_PROB  = 0.90
+
+    def __init__(self, cluster_map: Dict[int, List[int]], eval_every: int = 5,
+                 ddil_connectivity_prob: float = 0.90, **kwargs):
+        super().__init__(**kwargs)
+        self.eval_every             = eval_every
+        self.DDIL_CONNECTIVITY_PROB = ddil_connectivity_prob
+
+        self._client_to_cluster: Dict[int, int]       = {}
+        self._cluster_to_clients: Dict[int, List[int]] = {}
+        for cid, idxs in cluster_map.items():
+            self._cluster_to_clients[cid] = list(idxs)
+            for idx in idxs:
+                self._client_to_cluster[idx] = cid
+        self._n_clusters    = len(cluster_map)
+        self._total_clients = sum(len(v) for v in cluster_map.values())
+
+        self._ch_assignment: Dict[int, int] = {
+            cid: idxs[0] for cid, idxs in cluster_map.items() if idxs
+        }
+        self._client_signal_hist:    Dict[int, _deque] = defaultdict(lambda: _deque(maxlen=5))
+        self._client_weight_hist:    Dict[int, _deque] = defaultdict(lambda: _deque(maxlen=6))
+        self._cluster_eval_loss:     Dict[int, _deque] = {cid: _deque(maxlen=5) for cid in cluster_map}
+        self._cluster_loss_history:  Dict[int, List[float]] = {cid: [] for cid in cluster_map}
+        self._cluster_train_acc_hist: Dict[int, _deque] = {cid: _deque(maxlen=5) for cid in cluster_map}
+
+        self._isolation_state:   Dict[int, int]    = {}
+        self._expelled_clients:  set               = set()
+        self._reentry_queue:     Dict[int, _deque] = {}
+        self._last_detect_round: Dict[int, int]    = {}
+        # maxlen increased to 10 so local-baseline has enough history
+        self._ch_divergence_hist: Dict[int, _deque] = defaultdict(lambda: _deque(maxlen=10))
+        self._s2_consecutive:    Dict[int, int]    = defaultdict(int)
+        self._reputation:        Dict[int, float]  = defaultdict(lambda: 1.0)
+        self._missed_rounds:     Dict[int, int]    = defaultdict(int)
+        self._events: List[dict] = []
+
+    # ── DDIL connectivity dropout ──────────────────────────────────────────────
+    def _ddil_filter(self, results, server_round):
+        rng = np.random.default_rng(seed=server_round)
+        kept, dropped = [], []
+        for proxy, fit_res in results:
+            if rng.random() < self.DDIL_CONNECTIVITY_PROB:
+                kept.append((proxy, fit_res))
+            else:
+                client_idx = self._proxy_to_client_idx(proxy)
+                self._missed_rounds[client_idx] += 1
+                dropped.append(client_idx)
+        if dropped:
+            print(f"  [DDIL R{server_round}] {len(dropped)} client(s) missed uplink: {dropped}")
+        return kept
+
+    # ── Multi-Krum within-cluster ──────────────────────────────────────────────
+    @staticmethod
+    def _multi_krum(updates: List[Tuple[List[np.ndarray], int]], f: int
+                    ) -> List[Tuple[List[np.ndarray], int]]:
+        n = len(updates)
+        if n <= f + 2 or f == 0:
+            return updates
+        keep  = n - f
+        flats = [np.concatenate([w.flatten() for w in u[0]]) for u in updates]
+        dists = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = float(np.sum((flats[i] - flats[j]) ** 2))
+                dists[i, j] = dists[j, i] = d
+        scores   = [float(np.sum(np.sort(dists[i])[1: n - f - 1])) for i in range(n)]
+        selected = np.argsort(scores)[:keep]
+        return [updates[i] for i in selected]
+
+    # ── Reputation update ──────────────────────────────────────────────────────
+    def _update_reputation(self, cluster_id: int, updates: List[Tuple]):
+        if len(updates) < 2:
+            return
+        total_n  = sum(n for _, n in updates)
+        mean_vec = sum((np.concatenate([w.flatten() for w in wts]) * (n / total_n))
+                       for wts, n in updates)
+        members  = self._cluster_to_clients.get(cluster_id, [])
+        for cidx, (wts, _) in zip(members, updates):
+            flat = np.concatenate([w.flatten() for w in wts])
+            sim  = self._cosine_sim(flat, mean_vec)
+            self._reputation[cidx] = (self.REPUTATION_EMA * self._reputation[cidx] +
+                                      (1.0 - self.REPUTATION_EMA) * sim)
+
+    def configure_evaluate(self, server_round, parameters, client_manager):
+        if server_round % self.eval_every != 0:
+            return []
+        return super().configure_evaluate(server_round, parameters, client_manager)
+
+    def _proxy_to_client_idx(self, proxy) -> int:
+        return int(proxy.cid) % self._total_clients
+
+    @staticmethod
+    def _weighted_avg(weight_list):
+        total = sum(n for _, n in weight_list)
+        agg   = [sum(w[i] * (n / total) for w, n in weight_list)
+                 for i in range(len(weight_list[0][0]))]
+        return agg, total
+
+    @staticmethod
+    def _flatten(weights) -> np.ndarray:
+        return np.concatenate([w.flatten() for w in weights])
+
+    @staticmethod
+    def _cosine_sim(a, b) -> float:
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        return float(np.dot(a, b) / (na * nb)) if na > 1e-10 and nb > 1e-10 else 0.0
+
+    def _ch_health_ranking(self, cluster_id: int):
+        members = [c for c in self._cluster_to_clients[cluster_id]
+                   if c not in self._expelled_clients]
+        if not members:
+            return []
+        raw_lq, raw_ls = {}, {}
+        for cidx in members:
+            hist = list(self._client_signal_hist[cidx])
+            if not hist:
+                raw_lq[cidx] = 0.0; raw_ls[cidx] = 0.0
+            else:
+                g  = float(np.mean([h[0] for h in hist]))
+                lo = float(np.mean([h[1] for h in hist]))
+                ch = float(np.mean([h[2] for h in hist]))
+                raw_lq[cidx] = g
+                raw_ls[cidx] = lo * (1.0 - ch)
+        def _norm(d):
+            lo, hi = min(d.values()), max(d.values())
+            return {k: (v - lo) / (hi - lo + 1e-8) for k, v in d.items()}
+        lq_n = _norm(raw_lq); ls_n = _norm(raw_ls)
+        scores = {cidx: 0.6 * lq_n[cidx] + 0.4 * ls_n[cidx] for cidx in members}
+        return sorted(scores.items(), key=lambda x: -x[1])
+
+    def _detect_suspect(self, cluster_id: int, ch_idx: int):
+        my_hist = list(self._cluster_eval_loss[cluster_id])
+        signal1, slope1 = False, 0.0
+        if len(my_hist) >= 3:
+            xs     = np.arange(len(my_hist), dtype=float)
+            slope1 = float(np.polyfit(xs, my_hist, 1)[0])
+            other_slopes = []
+            for other_cid, other_hist in self._cluster_eval_loss.items():
+                if other_cid == cluster_id: continue
+                if other_cid in self._isolation_state or other_cid in self._reentry_queue: continue
+                oh = list(other_hist)
+                if len(oh) >= 3:
+                    other_slopes.append(float(np.polyfit(np.arange(len(oh), dtype=float), oh, 1)[0]))
+            if len(other_slopes) >= 1:
+                mean_other = float(np.mean(other_slopes))
+                signal1 = (slope1 > self.LOSS_SLOPE_THRESHOLD and
+                           slope1 > mean_other + self.LOSS_SLOPE_THRESHOLD)
+
+        wh = list(self._client_weight_hist[ch_idx])
+        signal2, sim = False, 0.0
+        if len(wh) >= 4:
+            sim = self._cosine_sim(wh[-1], wh[-4])
+            active_count = sum(1 for c in range(self._n_clusters)
+                               if c not in self._isolation_state and c not in self._reentry_queue)
+            dynamic_threshold = self.STAGNATION_THRESHOLD if active_count >= 2 else 0.9999
+            signal2 = sim > dynamic_threshold
+
+        if signal2:
+            self._s2_consecutive[cluster_id] += 1
+        else:
+            self._s2_consecutive[cluster_id] = 0
+
+        # ── S3: CH diverges from cluster members ──────────────────────────────
+        # Fix [6a]: require len >= 1 (was >= 2) — activates one round earlier
+        # Fix [6b]: local-baseline fallback when all other clusters are isolated/absent
+        my_div_hist = list(self._ch_divergence_hist[cluster_id])
+        signal3, divergence = False, 0.0
+        other_divs = []
+        if len(my_div_hist) >= 1:                          # [Fix 6a]: was >= 2
+            divergence = float(my_div_hist[-1])            # latest divergence
+            other_divs = [
+                float(np.mean(list(self._ch_divergence_hist[c])))
+                for c in range(self._n_clusters)
+                if c != cluster_id
+                and len(self._ch_divergence_hist[c]) >= 1  # [Fix 6a]: was >= 2
+                and c not in self._isolation_state
+                and c not in self._reentry_queue
+            ]
+            if len(other_divs) >= 1:
+                # Primary S3: comparative — divergence > peer mean + threshold
+                signal3 = divergence > float(np.mean(other_divs)) + self.CH_DIVERGENCE_THRESHOLD
+            elif len(my_div_hist) >= 5:
+                # [Fix 6b]: Local-baseline fallback when no peer clusters available
+                # (e.g. all others already expelled or in reentry).
+                # Baseline = minimum observed divergence over own first 5 rounds.
+                # If current divergence is 3× above that quiet baseline, fire S3.
+                baseline = float(np.min(my_div_hist[:5]))
+                signal3  = divergence > baseline * 3.0 + self.CH_DIVERGENCE_THRESHOLD
+                if signal3:
+                    print(f"    [S3-LOCAL C{cluster_id}] div={divergence:.5f} "
+                          f"baseline={baseline:.5f} (no peer clusters for comparison)")
+            else:
+                # Not enough history for either comparison — no S3 yet
+                signal3 = False
+
+        s2_persistent = self._s2_consecutive[cluster_id] >= self.S2_PERSISTENT_ROUNDS
+        other_divs_str = " ".join(f"{x:.5f}" for x in other_divs) if other_divs else "n/a"
+        print(f"    [DBG C{cluster_id}] sim={sim:.6f} div={divergence:.5f} "
+              f"other_divs=[{other_divs_str}] S2={signal2}(×{self._s2_consecutive[cluster_id]}) "
+              f"S3={signal3} s2_persist={s2_persistent}")
+
+        reason = (f"loss_slope={slope1:.5f} stagnation_sim={sim:.4f} "
+                  f"ch_divergence={divergence:.5f} S1={signal1} S2={signal2} S3={signal3} "
+                  f"s2_persist={s2_persistent}")
+        return (signal2 and (signal3 or s2_persistent)), reason
+
+    def _re_elect(self, cluster_id: int):
+        old_ch = self._ch_assignment[cluster_id]
+        self._expelled_clients.add(old_ch)
+        self._cluster_to_clients[cluster_id] = [
+            c for c in self._cluster_to_clients[cluster_id] if c != old_ch]
+        self._s2_consecutive[cluster_id] = 0
+        print(f"  [EXPEL]    cluster={cluster_id}: CH {old_ch} expelled")
+        ranked = self._ch_health_ranking(cluster_id)
+        if ranked:
+            new_ch, score = ranked[0]
+            self._ch_assignment[cluster_id] = new_ch
+            print(f"  [RE-ELECT] cluster={cluster_id}: new CH={new_ch} (health={score:.3f})")
+        else:
+            print(f"  [RE-ELECT] cluster={cluster_id}: no members left")
+            self._ch_assignment.pop(cluster_id, None)
+        self._isolation_state[cluster_id] = self.ISOLATION_ROUNDS
+        print(f"  [ISOLATE]  cluster={cluster_id}: {self.ISOLATION_ROUNDS} rounds")
+
+    def aggregate_evaluate(self, server_round, results, failures):
+        cluster_losses: Dict[int, List[float]] = defaultdict(list)
+        for proxy, ev_res in results:
+            client_idx = self._proxy_to_client_idx(proxy)
+            if client_idx in self._expelled_clients: continue
+            cid = self._client_to_cluster.get(client_idx, 0)
+            cluster_losses[cid].append(float(ev_res.loss))
+        for cid, losses in cluster_losses.items():
+            mean_loss = float(np.mean(losses))
+            self._cluster_eval_loss[cid].append(mean_loss)
+            self._cluster_loss_history[cid].append(mean_loss)
+        return super().aggregate_evaluate(server_round, results, failures)
+
+    def aggregate_fit(self, server_round, results, failures):
+        if not results:
+            return None, {}
+
+        # DDIL: drop clients that fail to connect this round
+        results = self._ddil_filter(results, server_round)
+        if not results:
+            print(f"  [Round {server_round}] all clients dropped by DDIL — skipping")
+            return None, {}
+
+        # ── Build result map FIRST (needed for divergence population) ──────────
+        # [Fix 6]: result map and divergence must be populated BEFORE detection
+        # so that _detect_suspect has this round's data available.
+        _result_map: Dict[int, Tuple] = {}
+        for _p, _fr in results:
+            _cidx = self._proxy_to_client_idx(_p)
+            _result_map[_cidx] = (parameters_to_ndarrays(_fr.parameters), _fr.num_examples)
+
+        # ── Populate CH divergence (BEFORE detection) ─────────────────────────
+        for cid in range(self._n_clusters):
+            ch_idx_s3 = self._ch_assignment.get(cid)
+            if ch_idx_s3 is None or ch_idx_s3 in self._expelled_clients: continue
+            ch_entry = _result_map.get(ch_idx_s3)
+            if ch_entry is None: continue
+            ch_flat = self._flatten(ch_entry[0])
+            non_ch  = [(w, n) for cidx, (w, n) in _result_map.items()
+                       if cidx in self._cluster_to_clients.get(cid, [])
+                       and cidx != ch_idx_s3 and cidx not in self._expelled_clients]
+            if len(non_ch) >= 1:
+                avg_excl, _ = self._weighted_avg(non_ch)
+                div = 1.0 - self._cosine_sim(ch_flat, self._flatten(avg_excl))
+                self._ch_divergence_hist[cid].append(div)
+
+        # ── Update weight/signal histories ────────────────────────────────────
+        for proxy, fit_res in results:
+            client_idx = self._proxy_to_client_idx(proxy)
+            if client_idx in self._expelled_clients: continue
+            m = fit_res.metrics
+            if "mean_g_opt" in m:
+                self._client_signal_hist[client_idx].append(
+                    (m["mean_g_opt"], m["mean_los"], m["mean_beam_change"]))
+            self._client_weight_hist[client_idx].append(
+                self._flatten(parameters_to_ndarrays(fit_res.parameters)))
+
+        # ── Health display (train_beam_acc + loss from fit metrics) ───────────
+        # [Fix 1]: health display uses "train_beam_acc" — must match fit() return key
+        health_parts = []
+        for cid in range(self._n_clusters):
+            members = [c for c in self._cluster_to_clients.get(cid, [])
+                       if c not in self._expelled_clients]
+            fit_map = {self._proxy_to_client_idx(p): r.metrics
+                       for p, r in results if self._proxy_to_client_idx(p) in members}
+            if fit_map:
+                # Try "train_beam_acc" first, fall back to "beam_accuracy"
+                accs   = [m.get("train_beam_acc") or m.get("beam_accuracy") or 0.0
+                          for m in fit_map.values()]
+                losses = [m.get("loss", 0.0) for m in fit_map.values()]
+                health_parts.append(
+                    f"C{cid}[tr_acc={np.mean(accs):.3f} loss={np.mean(losses):.3f}]")
+        if health_parts:
+            print(f"    Health R{server_round}: {' '.join(health_parts)}")
+
+        for cid in range(self._n_clusters):
+            members = [c for c in self._cluster_to_clients.get(cid, [])
+                       if c not in self._expelled_clients]
+            accs = [fit_res.metrics.get("train_beam_acc") or fit_res.metrics.get("beam_accuracy") or 0.0
+                    for proxy, fit_res in results
+                    if self._proxy_to_client_idx(proxy) in members]
+            if accs:
+                self._cluster_train_acc_hist[cid].append(float(np.mean(accs)))
+
+        # ── Byzantine detection (now has current-round divergence) ────────────
+        for cid in range(self._n_clusters):
+            ch_idx = self._ch_assignment.get(cid)
+            if (ch_idx is None or cid in self._isolation_state or cid in self._reentry_queue):
+                continue
+            if server_round - self._last_detect_round.get(cid, 0) < self.DETECT_COOLDOWN:
+                continue
+            is_suspect, reason = self._detect_suspect(cid, ch_idx)
+            if is_suspect:
+                print(f"  [DETECT R{server_round}] cluster={cid} CH={ch_idx}: {reason}")
+                self._events.append({"round": server_round, "event": "detect", "cluster": cid})
+                self._last_detect_round[cid] = server_round
+                self._re_elect(cid)
+
+        # ── Cluster aggregation (Multi-Krum + reputation weighting) ──────────
+        cluster_updates: Dict[int, List[Tuple]] = {k: [] for k in range(self._n_clusters)}
+        for proxy, fit_res in results:
+            client_idx = self._proxy_to_client_idx(proxy)
+            if client_idx in self._expelled_clients: continue
+            cluster_id = self._client_to_cluster.get(client_idx, 0)
+            cluster_updates[cluster_id].append(
+                (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples))
+
+        cluster_aggs, active_cids = [], []
+        for cid in range(self._n_clusters):
+            updates = cluster_updates[cid]
+            if not updates: continue
+
+            if self.USE_MULTI_KRUM and len(updates) > self.MULTI_KRUM_F + 2:
+                updates_krum = self._multi_krum(updates, self.MULTI_KRUM_F)
+                if len(updates_krum) < len(updates):
+                    print(f"  [KRUM C{cid}] removed {len(updates)-len(updates_krum)} divergent update(s)")
+                updates = updates_krum
+
+            members    = self._cluster_to_clients.get(cid, [])
+            rep_updates = []
+            for i, (wts, n) in enumerate(updates):
+                rep = max(self.REPUTATION_FLOOR,
+                          self._reputation[members[i]] if i < len(members) else 1.0)
+                rep_updates.append((wts, max(1, int(n * rep))))
+            self._update_reputation(cid, updates)
+
+            agg, total = self._weighted_avg(rep_updates)
+            if cid in self._isolation_state:
+                print(f"  [ISOLATED] cluster={cid}: {self._isolation_state[cid]} rounds remaining")
+                continue
+            if cid in self._reentry_queue and self._reentry_queue[cid]:
+                total = max(1, int(total * self._reentry_queue[cid][0]))
+            cluster_aggs.append((agg, total))
+            active_cids.append(cid)
+
+        for cid in list(self._isolation_state.keys()):
+            self._isolation_state[cid] -= 1
+            if self._isolation_state[cid] <= 0:
+                del self._isolation_state[cid]
+                self._reentry_queue[cid] = _deque(self.REENTRY_FRACS)
+                self._events.append({"round": server_round, "event": "reentry_start", "cluster": cid})
+                print(f"  [→REENTRY] cluster={cid}: beginning graduated re-entry")
+
+        for cid in list(self._reentry_queue.keys()):
+            frac = self._reentry_queue[cid].popleft()
+            print(f"  [REENTRY]  cluster={cid}: participation={frac:.0%}")
+            if not self._reentry_queue[cid]:
+                del self._reentry_queue[cid]
+                print(f"  [REENTRY]  cluster={cid}: fully re-integrated")
+
+        if not cluster_aggs:
+            print(f"  [Round {server_round}] all clusters isolated — global model unchanged")
+            return None, {}
+
+        global_weights, grand_total = self._weighted_avg(cluster_aggs)
+        labels = [f"CH{cid}←{n}" for cid, (_, n) in zip(active_cids, cluster_aggs)]
+        print(f"  [Round {server_round}] {' '.join(labels)} → global ({grand_total} total)")
+        return ndarrays_to_parameters(global_weights), {}
+
+
+print(f"HierarchicalFedAvg defined.")
+print(f"  CH_DIVERGENCE_THRESHOLD = {HierarchicalFedAvg.CH_DIVERGENCE_THRESHOLD} (raised — fixes false S3)")
+print(f"  S3: len(div_hist) >= 1 now; local-baseline fallback when no peers")
+print(f"  Divergence populated BEFORE detection (same-round data available)")
+print(f"  Health display: checks 'train_beam_acc' OR 'beam_accuracy' key")

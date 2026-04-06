@@ -1,0 +1,72 @@
+# ── Results Comparison Table ──────────────────────────────────────────────────
+# Side-by-side summary of all methods: lower bound → FL variants → upper bound
+
+import numpy as np
+import pandas as pd
+
+# ── Extract best hierarchical FL metrics ─────────────────────────────────────
+def _best_from_history(history, key="beam_accuracy"):
+    """Pull the best round value for a given metric from Flower history."""
+    vals = []
+    for _, v in getattr(history, "metrics_distributed", {}).get(key, []):
+        vals.append(v)
+    # Also check centralized metrics
+    for _, v in getattr(history, "metrics_centralized", {}).get(key, []):
+        vals.append(v)
+    return float(np.max(vals)) if vals else float("nan")
+
+def _best_loss(history):
+    losses = [v for _, v in history.losses_distributed] if history.losses_distributed else []
+    return float(np.min(losses)) if losses else float("nan")
+
+# channel_history = result from the hierarchical FL simulation (attack scenario)
+# Use safe fallbacks if these are not yet defined
+_hier_top1  = _best_from_history(channel_history, "beam_accuracy")  if "channel_history"  in dir() else float("nan")
+_hier_top3  = _best_from_history(channel_history, "beam_top3")      if "channel_history"  in dir() else float("nan")
+_hier_loss  = _best_loss(channel_history)                            if "channel_history"  in dir() else float("nan")
+
+# ── Build comparison dataframe ────────────────────────────────────────────────
+rows = [
+    {
+        "Method":          "Random Beam (lower bound)",
+        "Top-1 Acc":       f"{RANDOM_ACC*100:.2f}%",
+        "Top-3 Acc":       f"{RANDOM_TOP3*100:.2f}%",
+        "Notes":           "Empirical frequency baseline; no learning",
+    },
+    {
+        "Method":          "Flat FedAvg (no hierarchy)",
+        "Top-1 Acc":       f"{FLAT_ACC*100:.2f}%",
+        "Top-3 Acc":       f"{FLAT_TOP3*100:.2f}%",
+        "Notes":           "Standard FedAvg, 30 rounds, no attack",
+    },
+    {
+        "Method":          "Hierarchical FL + Byzantine (ours)",
+        "Top-1 Acc":       f"{_hier_top1*100:.2f}%" if not np.isnan(_hier_top1) else "N/A",
+        "Top-3 Acc":       f"{_hier_top3*100:.2f}%" if not np.isnan(_hier_top3) else "N/A",
+        "Notes":           "2-level hierarchy, S2∧S3 Byzantine detection, attack @R11",
+    },
+    {
+        "Method":          "Centralized SGD (upper bound)",
+        "Top-1 Acc":       f"{CENT_ACC*100:.2f}%",
+        "Top-3 Acc":       f"{CENT_TOP3*100:.2f}%",
+        "Notes":           "All data pooled; genie bound — not achievable in FL",
+    },
+]
+
+df = pd.DataFrame(rows, columns=["Method", "Top-1 Acc", "Top-3 Acc", "Notes"])
+df.index = df.index + 1   # 1-indexed for readability
+
+print("=" * 85)
+print("  BEAM PREDICTION — METHOD COMPARISON SUMMARY")
+print("=" * 85)
+print(df.to_string(index=True))
+print("=" * 85)
+
+# ── Gap analysis ──────────────────────────────────────────────────────────────
+if not np.isnan(_hier_top1):
+    gap_vs_flat = (_hier_top1 - FLAT_ACC) * 100
+    gap_vs_cent = (CENT_ACC   - _hier_top1) * 100
+    gap_vs_rand = (_hier_top1 - RANDOM_ACC) * 100
+    print(f"\nHierarchical FL vs Flat FedAvg : {gap_vs_flat:+.2f} pp")
+    print(f"Hierarchical FL vs Centralized  : {gap_vs_cent:+.2f} pp gap to genie bound")
+    print(f"Hierarchical FL vs Random       : {gap_vs_rand:+.2f} pp gain over lower bound")

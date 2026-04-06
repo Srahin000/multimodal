@@ -1,0 +1,108 @@
+# ── Cell: Federated Training — Channel-Only (Hierarchical + Byzantine Attack) ──
+# UAV / DDIL environment simulation:
+#   - DDIL channel impairments: Doppler phase noise + packet dropout + blockage
+#     applied inside each client's fit() call (see BeamFlowerClient._apply_ddil)
+#   - DDIL connectivity: 90% of clients connect each round (server-side dropout)
+#   - FedProx: μ=0.01 proximal term prevents non-IID cluster drift
+#   - Multi-Krum: f=1 within-cluster filter for robust aggregation
+#   - Reputation scoring: EMA trust weights per client
+#   - attack_start_round=11 → 10 clean rounds establish baseline, then attack begins
+
+import time, io as _io, zipfile as _zf
+
+seed               = CFG.get("seed", 42)
+nr                 = ds.nr
+nt                 = ds.nt
+beam_codebook_size = CFG["Q_tx"]
+
+ATTACK_CLUSTER     = 0
+ATTACK_START_ROUND = 11
+EVAL_EVERY         = 5
+DDIL_CONN_PROB     = CFG.get("ddil_connectivity_prob", 0.90)
+
+if ray.is_initialized():
+    ray.shutdown()
+    print("Ray shutdown")
+
+
+def client_fn(context: fl.common.Context) -> fl.client.Client:
+    client_idx = int(context.node_id) % len(clients)
+    client_obj = clients[client_idx]
+
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+    tf.random.set_seed(seed + client_idx)
+    np.random.seed(seed + client_idx)
+
+    model = BeamModel(nr, nt, beam_codebook_size)
+    model.build_model(nr, nt)
+
+    client = BeamFlowerClient(
+        model         = model,
+        dataset       = ds,
+        train_indices = client_obj.train_indices,
+        test_indices  = client_obj.test_indices,
+        cfg           = CFG,
+        trajectory_id = client_obj.trajectory_id,
+        beam_changes  = beam_changes_global,
+    )
+    client.tx_codebook = ds.tx_codebook
+    client.rx_codebook = ds.rx_codebook
+    client.cache_dir   = PRECOMPUTE_CACHE_DIR
+    client.client_idx  = client_idx
+    return client.to_client()
+
+
+tf.keras.backend.clear_session()
+global_model = BeamModel(nr, nt, beam_codebook_size)
+global_model.build_model(nr, nt)
+
+
+def agg_metrics(metrics):
+    agg = {}
+    for _, m in metrics:
+        for k, v in m.items():
+            agg.setdefault(k, []).append(v)
+    return {k: float(np.mean(v)) for k, v in agg.items()
+            if v and isinstance(v[0], (int, float, np.integer, np.floating))}
+
+
+cluster_map = build_clusters(clients)
+
+strategy = AttackingHierarchicalFedAvg(
+    cluster_map            = cluster_map,
+    attack_cluster         = ATTACK_CLUSTER,
+    attack_start_round     = ATTACK_START_ROUND,
+    eval_every             = EVAL_EVERY,
+    ddil_connectivity_prob = DDIL_CONN_PROB,
+    fraction_fit                    = CFG["client_frac"],
+    fraction_evaluate               = CFG["client_frac"],
+    min_fit_clients                 = len(clients),
+    min_evaluate_clients            = len(clients),
+    min_available_clients           = len(clients),
+    initial_parameters              = fl.common.ndarrays_to_parameters(
+                                          global_model.get_weights()),
+    fit_metrics_aggregation_fn      = agg_metrics,
+    evaluate_metrics_aggregation_fn = agg_metrics,
+)
+
+num_rounds = 30
+print(f"\nHierarchical FL + Byzantine Attack (UAV/DDIL): {num_rounds} rounds, {len(clients)} clients")
+print(f"  Attack   : CH{ATTACK_CLUSTER} stale-weight injection from round {ATTACK_START_ROUND}")
+print(f"  DDIL     : connectivity={DDIL_CONN_PROB*100:.0f}%  "
+      f"doppler_std={CFG['ddil_doppler_noise_std']}  "
+      f"pkt_drop={CFG['ddil_packet_dropout']*100:.0f}%  "
+      f"blockage={CFG['ddil_signal_blockage_prob']*100:.0f}%")
+print(f"  FedProx  : μ={CFG['fedprox_mu']}")
+print(f"  Multi-Krum: f={HierarchicalFedAvg.MULTI_KRUM_F}")
+print(f"  Reputation: EMA α={HierarchicalFedAvg.REPUTATION_EMA}")
+print(f"  Evaluate : every {EVAL_EVERY} rounds\n")
+
+channel_history = fl.simulation.start_simulation(
+    client_fn        = client_fn,
+    num_clients      = len(clients),
+    config           = fl.server.ServerConfig(num_rounds=num_rounds),
+    strategy         = strategy,
+    client_resources = {"num_cpus": 1, "num_gpus": 0.0},
+)
+print("Hierarchical FL complete.")
